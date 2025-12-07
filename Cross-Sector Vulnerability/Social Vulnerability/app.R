@@ -1,0 +1,238 @@
+# ==============================================================================
+# SCRIPT: app.R
+# PURPOSE: High-Resolution Dashboard with "Update" Button (Prevents Freezing)
+# ==============================================================================
+
+library(shiny)
+library(leaflet)
+library(tidyverse)
+library(sf)
+
+# 1. LOAD DATA (FULL DETAIL)
+# Disable strict spherical math
+sf_use_s2(FALSE)
+
+print("Loading Data...")
+# Ensure you have run the 'saveRDS' line in your Master Script first!
+basin_data <- readRDS("data/ready_to_map_data.rds")
+
+print("Transforming to Lat/Lon...")
+# Convert to Map Coordinates (EPSG:4326)
+# We use st_make_valid to fix any geometry errors that might crash the map
+basin_data <- basin_data %>% 
+  st_make_valid() %>%
+  st_transform(4326)
+
+print("Data Ready.")
+
+# 2. DEFINE S-CURVE FUNCTIONS
+s_curve_increasing <- function(x, b, k) {
+  if(is.na(b)) return(x)
+  1 / (1 + (b / x)^k)
+}
+
+s_curve_decreasing <- function(x, b, k) {
+  if(is.na(b)) return(x)
+  ifelse(x == 0, 1, 1 / (1 + (x / b)^k))
+}
+
+# 3. USER INTERFACE
+ui <- fluidPage(
+  titlePanel("Drought Risk Model: Social Vulnerability Dashboard"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      width = 3,
+      h4("Configuration"),
+      helpText("Adjust sliders, then click Update to refresh the map."),
+      
+      # --- THE MAGIC BUTTON ---
+      actionButton("update_btn", "REFRESH MAP", icon = icon("refresh"), 
+                   class = "btn-success btn-lg", width = "100%"),
+      br(), br(),
+      # ------------------------
+      
+      tabsetPanel(
+        tabPanel("Steepness (k)",
+                 br(),
+                 sliderInput("k_gender", "Gender Equality (k)", 0.5, 15, 5, step=0.5),
+                 sliderInput("k_rural", "Rural Population (k)", 0.5, 15, 5, step=0.5),
+                 sliderInput("k_arope", "Poverty Risk (k)", 0.5, 15, 5, step=0.5),
+                 sliderInput("k_dep", "Social Dependency (k)", 0.5, 15, 5, step=0.5),
+                 sliderInput("k_hdi", "HDI (k)", 0.5, 15, 5, step=0.5)
+        ),
+        tabPanel("Weights (w)",
+                 br(),
+                 numericInput("w_gender", "Weight: Gender", 0.15, 0, 1, 0.05),
+                 numericInput("w_rural", "Weight: Rural", 0.30, 0, 1, 0.05),
+                 numericInput("w_arope", "Weight: Poverty", 0.15, 0, 1, 0.05),
+                 numericInput("w_dep", "Weight: Dependency", 0.15, 0, 1, 0.05),
+                 numericInput("w_hdi", "Weight: HDI", 0.25, 0, 1, 0.05),
+                 helpText("Sum should equal 1.0")
+        )
+      )
+    ),
+    
+    mainPanel(
+      width = 9,
+      # Loading Message Style
+      tags$head(tags$style(type="text/css", "
+        #loadmessage {
+          position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+          padding: 20px; background-color: rgba(0,0,0,0.8); color: white; 
+          border-radius: 10px; z-index: 1005; font-size: 20px;
+        }
+      ")),
+      
+      # Show this message when R is busy calculating
+      conditionalPanel(condition="$('html').hasClass('shiny-busy')",
+                       tags$div("Processing High-Res Map... Please Wait...", id="loadmessage")),
+      
+      leafletOutput("map", height = "800px"),
+      br(),
+      h4("Basin Data Preview (Top 5 Vulnerable)"),
+      tableOutput("top_basins")
+    )
+  )
+)
+
+# 4. SERVER LOGIC
+server <- function(input, output, session) {
+  
+  # A. REACTIVE CALCULATION (Triggered ONLY by Button)
+  # eventReactive ensures the code ONLY runs when input$update_btn is clicked
+  # ignoreNULL = FALSE means it runs once automatically when the app starts
+  live_data <- eventReactive(input$update_btn, {
+    
+    data <- basin_data
+    
+    # 1. Recalculate Indicators
+    mid_gender <- mean(data$`RAW_Gender Equality`, na.rm=TRUE)
+    data$V_Gender <- s_curve_decreasing(data$`RAW_Gender Equality`, mid_gender, input$k_gender)
+    
+    mid_rural <- mean(data$`RAW_Rural Population`, na.rm=TRUE)
+    data$V_Rural <- s_curve_increasing(data$`RAW_Rural Population`, mid_rural, input$k_rural)
+    
+    mid_arope <- mean(data$`RAW_Poverty Risk (AROPE)`, na.rm=TRUE)
+    data$V_Arope <- s_curve_increasing(data$`RAW_Poverty Risk (AROPE)`, mid_arope, input$k_arope)
+    
+    mid_dep <- mean(data$`RAW_Social Dependency`, na.rm=TRUE)
+    data$V_Dep <- s_curve_increasing(data$`RAW_Social Dependency`, mid_dep, input$k_dep)
+    
+    mid_hdi <- mean(data$`RAW_Human Development Index`, na.rm=TRUE)
+    data$V_HDI <- s_curve_decreasing(data$`RAW_Human Development Index`, mid_hdi, input$k_hdi)
+    
+    # 2. Calculate Final Index
+    data$Social_Index <- (data$V_Gender * input$w_gender) +
+      (data$V_Rural * input$w_rural) +
+      (data$V_Arope * input$w_arope) +
+      (data$V_Dep * input$w_dep) +
+      (data$V_HDI * input$w_hdi)
+    
+    return(data)
+  }, ignoreNULL = FALSE)
+  
+  # B. BASE MAP (Draws once)
+  output$map <- renderLeaflet({
+    leaflet() %>%
+      addProviderTiles(providers$CartoDB.Positron)
+  })
+  
+  # C. UPDATE MAP LAYERS (Observer)
+  observe({
+    # Wait for the button click data
+    req(live_data())
+    df <- live_data()
+    
+    # Create Popup
+    my_popup <- paste0(
+      "<strong>Basin ID: </strong>", df$HYBAS_ID, "<br/>",
+      "<hr>",
+      "<strong>TOTAL VULNERABILITY: ", round(df$Social_Index, 3), "</strong><br/>",
+      "<br/>",
+      "<b>Gender Eq:</b> ", round(df$V_Gender, 3), " (Raw: ", round(df$`RAW_Gender Equality`, 1), ")<br/>",
+      "<b>Rural Pop:</b> ", round(df$V_Rural, 3), " (Raw: ", round(df$`RAW_Rural Population`, 1), "%)<br/>",
+      "<b>Poverty:</b> ", round(df$V_Arope, 3), " (Raw: ", round(df$`RAW_Poverty Risk (AROPE)`, 1), "%)<br/>",
+      "<b>Dependency:</b> ", round(df$V_Dep, 3), " (Raw: ", round(df$`RAW_Social Dependency`, 1), ")<br/>",
+      "<b>HDI:</b> ", round(df$V_HDI, 3), " (Raw: ", round(df$`RAW_Human Development Index`, 2), ")"
+    )
+    
+    # Palettes
+    pal_main <- colorNumeric("RdYlBu", domain = c(0, 1), reverse = TRUE)
+    pal_single <- colorNumeric("YlOrRd", domain = c(0, 1))
+    
+    # Update Map
+    leafletProxy("map", data = df) %>%
+      clearShapes() %>% 
+      
+      # LAYER 1: Overall
+      addPolygons(
+        group = "Social Vulnerability (Overall)",
+        fillColor = ~pal_main(Social_Index),
+        color = "black", weight = 1, opacity = 1, fillOpacity = 1.0, 
+        popup = my_popup
+      ) %>%
+      
+      # LAYER 2: Gender
+      addPolygons(
+        group = "Gender Equality",
+        fillColor = ~pal_single(V_Gender),
+        color = "black", weight = 1, opacity = 1, fillOpacity = 1.0,
+        popup = my_popup
+      ) %>%
+      
+      # LAYER 3: Rural
+      addPolygons(
+        group = "Rural Population",
+        fillColor = ~pal_single(V_Rural),
+        color = "black", weight = 1, opacity = 1, fillOpacity = 1.0,
+        popup = my_popup
+      ) %>%
+      
+      # LAYER 4: Poverty
+      addPolygons(
+        group = "Poverty Risk",
+        fillColor = ~pal_single(V_Arope),
+        color = "black", weight = 1, opacity = 1, fillOpacity = 1.0,
+        popup = my_popup
+      ) %>%
+      
+      # LAYER 5: Dependency
+      addPolygons(
+        group = "Social Dependency",
+        fillColor = ~pal_single(V_Dep),
+        color = "black", weight = 1, opacity = 1, fillOpacity = 1.0,
+        popup = my_popup
+      ) %>%
+      
+      # LAYER 6: HDI
+      addPolygons(
+        group = "HDI",
+        fillColor = ~pal_single(V_HDI),
+        color = "black", weight = 1, opacity = 1, fillOpacity = 1.0,
+        popup = my_popup
+      ) %>%
+      
+      addLayersControl(
+        baseGroups = c(
+          "Social Vulnerability (Overall)", "Gender Equality", 
+          "Rural Population", "Poverty Risk", 
+          "Social Dependency", "HDI"
+        ),
+        options = layersControlOptions(collapsed = FALSE)
+      ) %>%
+      addLegend("bottomright", pal = pal_main, values = c(0,1), 
+                title = "Vulnerability Index", layerId = "legend")
+  })
+  
+  # D. TABLE PREVIEW
+  output$top_basins <- renderTable({
+    live_data() %>% 
+      st_drop_geometry() %>%
+      select(HYBAS_ID, Social_Index, V_Gender, V_Rural, V_Arope, V_Dep, V_HDI) %>%
+      arrange(desc(Social_Index)) %>%
+      head(5)
+  })
+}
+
+shinyApp(ui, server)

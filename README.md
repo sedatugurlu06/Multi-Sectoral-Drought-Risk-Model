@@ -1,1 +1,0 @@
-# Multi-Sectoral-Drought-Risk-Model
